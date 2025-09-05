@@ -97,7 +97,11 @@ pub fn build_for_target(
 
     // Нормализуем абсолютные пути, чтобы не зависеть от current_dir() cargo-ndk
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-    let out_abs: PathBuf = if out.is_absolute() { out.clone() } else { cwd.join(out) };
+    let out_abs: PathBuf = if out.is_absolute() {
+      out.clone()
+    } else {
+      cwd.join(out)
+    };
 
     // финальная папка и временный вывод cargo-ndk
     let final_dir = out_abs.join("android-arm64");
@@ -106,18 +110,21 @@ pub fn build_for_target(
 
     let tmp_out = out_abs.join(".ndk-out");
     let _ = std::fs::remove_dir_all(&tmp_out);
-    std::fs::create_dir_all(&tmp_out)
-      .map_err(|e| format!("mkdir {}: {e}", tmp_out.display()))?;
+    std::fs::create_dir_all(&tmp_out).map_err(|e| format!("mkdir {}: {e}", tmp_out.display()))?;
 
     // ВАЖНО: --target не указываем; cargo-ndk сам ставит по -t arm64-v8a
     let status = std::process::Command::new("cargo")
       .current_dir(mod_path) // билдим в каталоге мода
       .args([
         "ndk",
-        "-t","arm64-v8a",
-        "--platform","26",
-        "-o", tmp_out.to_str().ok_or("bad tmp_out path")?,
-        "build","--release",
+        "-t",
+        "arm64-v8a",
+        "--platform",
+        "26",
+        "-o",
+        tmp_out.to_str().ok_or("bad tmp_out path")?,
+        "build",
+        "--release",
       ])
       .status()
       .map_err(|e| format!("cargo-ndk failed to start: {e}"))?;
@@ -131,7 +138,10 @@ pub fn build_for_target(
       while let Some(dir) = stack.pop() {
         for ent in std::fs::read_dir(&dir).ok()?.flatten() {
           let p = ent.path();
-          if p.is_dir() { stack.push(p); continue; }
+          if p.is_dir() {
+            stack.push(p);
+            continue;
+          }
           if p.extension().and_then(|e| e.to_str()) == Some("so") {
             return Some(p);
           }
@@ -143,10 +153,18 @@ pub fn build_for_target(
     let so_path = find_first_so(&tmp_out)
       .ok_or_else(|| format!("no .so produced by cargo-ndk under {}", tmp_out.display()))?;
 
-    let file_name = so_path.file_name().and_then(|s| s.to_str()).ok_or("bad output filename")?;
+    let file_name = so_path
+      .file_name()
+      .and_then(|s| s.to_str())
+      .ok_or("bad output filename")?;
     let dst = final_dir.join(file_name);
-    std::fs::copy(&so_path, &dst)
-      .map_err(|e| format!("copy {} -> {} failed: {e}", so_path.display(), dst.display()))?;
+    std::fs::copy(&so_path, &dst).map_err(|e| {
+      format!(
+        "copy {} -> {} failed: {e}",
+        so_path.display(),
+        dst.display()
+      )
+    })?;
 
     // подчистить времянку (не критично, но приятно)
     let _ = std::fs::remove_dir_all(&tmp_out);
@@ -202,9 +220,9 @@ pub fn build_for_target(
     };
     if v["reason"] == "compiler-artifact"
       && v["target"]["kind"]
-      .as_array()
-      .map(|kinds| kinds.iter().any(|k| k == "cdylib"))
-      .unwrap_or(false)
+        .as_array()
+        .map(|kinds| kinds.iter().any(|k| k == "cdylib"))
+        .unwrap_or(false)
     {
       if let Some(arr) = v["filenames"].as_array() {
         for p in arr {
@@ -253,8 +271,8 @@ fn choose_best(files: &[PathBuf], target: &BuildTarget) -> Option<PathBuf> {
   for f in files {
     if f.extension().and_then(|e| e.to_str()) == Some(target.ext)
       && f
-      .to_string_lossy()
-      .contains(&format!("/target/{}/", target.triple))
+        .to_string_lossy()
+        .contains(&format!("/target/{}/", target.triple))
     {
       return Some(f.clone());
     }
