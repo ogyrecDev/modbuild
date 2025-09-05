@@ -1,10 +1,11 @@
 // modbuild/src/build.rs
 
-use crate::utils::{has_mac_compiler, has_zigbuild, is_host_triple};
 use std::fs;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+use crate::utils::{has_mac_compiler, has_zigbuild, is_host_triple};
 
 /// Represents a build target (OS + architecture)
 #[derive(Clone)]
@@ -15,7 +16,7 @@ pub struct BuildTarget {
   pub needs_mac: bool,
 }
 
-/// All supported targets
+/// All supported targets (добавлен android-arm64)
 pub fn all_targets() -> Vec<BuildTarget> {
   vec![
     BuildTarget {
@@ -48,6 +49,12 @@ pub fn all_targets() -> Vec<BuildTarget> {
       ext: "dylib",
       needs_mac: true,
     },
+    BuildTarget {
+      name: "android-arm64",
+      triple: "aarch64-linux-android",
+      ext: "so",
+      needs_mac: false,
+    },
   ]
 }
 
@@ -70,6 +77,7 @@ pub fn build_for_target(
   target: &BuildTarget,
   mod_path: &PathBuf,
 ) -> Result<(), String> {
+  // --- macOS ограничения для кросс-компиляции ---
   if target.needs_mac && !has_mac_compiler() {
     return Err(format!("Skipping {}: mac compiler not found", target.name));
   }
@@ -79,9 +87,78 @@ pub fn build_for_target(
     return Err("Skipping windows-msvc: cannot cross-compile MSVC from macOS".into());
   }
 
+  // --- Android: используем cargo-ndk с абсолютным -o и перекладываем .so в native/android-arm64 ---
+  if target.name == "android-arm64" {
+    if !has_cargo_ndk() {
+      return Err("cargo-ndk not found. Install: `cargo install cargo-ndk`".into());
+    }
+
+    println!("Building for {} (via cargo-ndk)...", target.name);
+
+    // Нормализуем абсолютные пути, чтобы не зависеть от current_dir() cargo-ndk
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let out_abs: PathBuf = if out.is_absolute() { out.clone() } else { cwd.join(out) };
+
+    // финальная папка и временный вывод cargo-ndk
+    let final_dir = out_abs.join("android-arm64");
+    std::fs::create_dir_all(&final_dir)
+      .map_err(|e| format!("mkdir {}: {e}", final_dir.display()))?;
+
+    let tmp_out = out_abs.join(".ndk-out");
+    let _ = std::fs::remove_dir_all(&tmp_out);
+    std::fs::create_dir_all(&tmp_out)
+      .map_err(|e| format!("mkdir {}: {e}", tmp_out.display()))?;
+
+    // ВАЖНО: --target не указываем; cargo-ndk сам ставит по -t arm64-v8a
+    let status = std::process::Command::new("cargo")
+      .current_dir(mod_path) // билдим в каталоге мода
+      .args([
+        "ndk",
+        "-t","arm64-v8a",
+        "--platform","26",
+        "-o", tmp_out.to_str().ok_or("bad tmp_out path")?,
+        "build","--release",
+      ])
+      .status()
+      .map_err(|e| format!("cargo-ndk failed to start: {e}"))?;
+    if !status.success() {
+      return Err("android build failed".into());
+    }
+
+    // Ищем любой .so под tmp_out/** (обычно tmp_out/arm64-v8a/lib*.so)
+    fn find_first_so(root: &PathBuf) -> Option<PathBuf> {
+      let mut stack = vec![root.clone()];
+      while let Some(dir) = stack.pop() {
+        for ent in std::fs::read_dir(&dir).ok()?.flatten() {
+          let p = ent.path();
+          if p.is_dir() { stack.push(p); continue; }
+          if p.extension().and_then(|e| e.to_str()) == Some("so") {
+            return Some(p);
+          }
+        }
+      }
+      None
+    }
+
+    let so_path = find_first_so(&tmp_out)
+      .ok_or_else(|| format!("no .so produced by cargo-ndk under {}", tmp_out.display()))?;
+
+    let file_name = so_path.file_name().and_then(|s| s.to_str()).ok_or("bad output filename")?;
+    let dst = final_dir.join(file_name);
+    std::fs::copy(&so_path, &dst)
+      .map_err(|e| format!("copy {} -> {} failed: {e}", so_path.display(), dst.display()))?;
+
+    // подчистить времянку (не критично, но приятно)
+    let _ = std::fs::remove_dir_all(&tmp_out);
+
+    println!("Copied to {}", dst.display());
+    return Ok(());
+  }
+
+  // --- Все остальные цели как раньше: cargo build/zigbuild + парсинг JSON ---
   println!("Building for {}...", target.name);
 
-  // Choose cargo subcommand: prefer zigbuild for macOS / cross, else plain build
+  // выбираем subcommand (zigbuild для кросса, если доступен)
   let use_zig = if target.needs_mac {
     has_zigbuild() && has_mac_compiler()
   } else if !is_host_triple(target.triple) {
@@ -125,9 +202,9 @@ pub fn build_for_target(
     };
     if v["reason"] == "compiler-artifact"
       && v["target"]["kind"]
-        .as_array()
-        .map(|kinds| kinds.iter().any(|k| k == "cdylib"))
-        .unwrap_or(false)
+      .as_array()
+      .map(|kinds| kinds.iter().any(|k| k == "cdylib"))
+      .unwrap_or(false)
     {
       if let Some(arr) = v["filenames"].as_array() {
         for p in arr {
@@ -176,8 +253,8 @@ fn choose_best(files: &[PathBuf], target: &BuildTarget) -> Option<PathBuf> {
   for f in files {
     if f.extension().and_then(|e| e.to_str()) == Some(target.ext)
       && f
-        .to_string_lossy()
-        .contains(&format!("/target/{}/", target.triple))
+      .to_string_lossy()
+      .contains(&format!("/target/{}/", target.triple))
     {
       return Some(f.clone());
     }
@@ -194,4 +271,15 @@ fn add_suffix(file_name: &str, suffix: &str) -> String {
   } else {
     format!("{file_name}{suffix}")
   }
+}
+
+/// Простая проверка наличия cargo-ndk
+fn has_cargo_ndk() -> bool {
+  Command::new("cargo")
+    .args(["ndk", "--version"])
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false)
 }
